@@ -22,18 +22,29 @@ sealed class MusicDesktop : ApplicationContext
     static extern bool SystemParametersInfo(int action, int parameter, string value, int flags);
     [DllImport("user32.dll")]
     static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("dwmapi.dll")]
+    static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
+    [DllImport("dwmapi.dll")]
+    static extern int DwmExtendFrameIntoClientArea(IntPtr window, ref FrameMargins margins);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct FrameMargins
+    {
+        public int Left, Right, Top, Bottom;
+    }
 
     readonly string folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MusicDesktop");
     readonly string artwork = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "furina.jpg");
     static readonly string Startup = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "Music Desktop.lnk");
     readonly NotifyIcon tray = new NotifyIcon();
+    Appearance appearance = new Appearance();
+    Form settingsWindow;
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
     readonly TcpListener listener = new TcpListener(IPAddress.Loopback, 17847);
     readonly Dictionary<int, Track> tracks = new Dictionary<int, Track>();
     readonly Dictionary<string, SongLyrics> cache = new Dictionary<string, SongLyrics>();
     readonly object tracksLock = new object();
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
-    readonly ToolStripMenuItem startupItem;
     string background, original, backup, activeKey, frameKey;
     bool applied;
     volatile bool closing;
@@ -135,45 +146,24 @@ sealed class MusicDesktop : ApplicationContext
 
         listener.Start();
         Serve();
-        var menu = new ContextMenuStrip();
-        var change = menu.Items.Add("Change background");
-        change.Click += delegate { ChooseBackground(preference); };
-        var displays = (ToolStripMenuItem)menu.Items.Add("Display");
-        displays.DropDownOpening += delegate
+        var appearancePath = Path.Combine(folder, "appearance.json");
+        try
         {
-            while (displays.DropDownItems.Count > 0) displays.DropDownItems[0].Dispose();
-            foreach (var screen in Screen.AllScreens)
+            if (File.Exists(appearancePath))
             {
-                var device = screen.DeviceName;
-                var number = Regex.Match(device, @"\d+$").Value;
-                var label = "Display " + number + " (" + screen.Bounds.Width + " × " + screen.Bounds.Height + ")" +
-                    (screen.Primary ? " — primary" : "");
-                var item = (ToolStripMenuItem)displays.DropDownItems.Add(label);
-                item.Checked = TargetScreen().DeviceName == device;
-                item.Click += delegate
-                {
-                    try
-                    {
-                        File.WriteAllText(displayPreference, device);
-                        selectedDisplay = device;
-                        surfaceAttempted = false;
-                        frameKey = null;
-                        Tick();
-                        if (surface == null)
-                            tray.ShowBalloonTip(3500, "LyricFrame", "Could not attach to this display. Try reopening LyricFrame.", ToolTipIcon.Warning);
-                    }
-                    catch (Exception error) { MessageBox.Show(error.Message, "LyricFrame"); }
-                };
+                var saved = json.Deserialize<Appearance>(File.ReadAllText(appearancePath));
+                if (saved != null) appearance = saved;
             }
-        };
-        startupItem = (ToolStripMenuItem)menu.Items.Add("Start with Windows");
-        startupItem.Checked = File.Exists(Startup);
-        startupItem.Click += delegate { ToggleStartup(); };
-        menu.Items.Add("Quit LyricFrame").Click += delegate { ExitThread(); };
+        }
+        catch (IOException) { }
+        catch (ArgumentException) { }
+        catch (InvalidOperationException) { }
         tray.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
         tray.Text = "LyricFrame";
-        tray.ContextMenuStrip = menu;
-        tray.DoubleClick += delegate { ChooseBackground(preference); };
+        tray.MouseClick += delegate(object sender, MouseEventArgs args)
+        {
+            if (args.Button == MouseButtons.Left || args.Button == MouseButtons.Right) ShowSettings(appearancePath, preference, displayPreference);
+        };
         tray.Visible = true;
         timer.Interval = 500;
         timer.Tick += delegate { Tick(); };
@@ -181,11 +171,319 @@ sealed class MusicDesktop : ApplicationContext
         Tick();
     }
 
-    void ToggleStartup()
+    sealed class Appearance
     {
-        try { SetStartup(!File.Exists(Startup)); }
-        catch (Exception error) { MessageBox.Show(error.Message, "Music Desktop"); }
-        startupItem.Checked = File.Exists(Startup);
+        public string FontName { get; set; }
+        public int TextColor { get; set; }
+        public int ClockSize { get; set; }
+        public int TitleSize { get; set; }
+        public int LyricSize { get; set; }
+
+        public Appearance()
+        {
+            FontName = "Segoe UI";
+            TextColor = Color.White.ToArgb();
+            ClockSize = TitleSize = LyricSize = 100;
+        }
+    }
+
+    void ShowSettings(string path, string backgroundPath, string displayPath)
+    {
+        if (settingsWindow != null)
+        {
+            settingsWindow.Activate();
+            return;
+        }
+
+        var popup = new Form
+        {
+            Text = "LyricFrame Settings", FormBorderStyle = FormBorderStyle.None,
+            ShowInTaskbar = false, TopMost = true, StartPosition = FormStartPosition.Manual,
+            AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            AutoScaleDimensions = new SizeF(96, 96), AutoScaleMode = AutoScaleMode.Dpi,
+            BackColor = PopupBackground, ForeColor = PopupText, KeyPreview = true
+        };
+        settingsWindow = popup;
+        popup.FormClosed += delegate { settingsWindow = null; };
+        var layout = new TableLayoutPanel
+        {
+            AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2,
+            Padding = new Padding(18, 14, 18, 16), Dock = DockStyle.Fill, BackColor = PopupBackground
+        };
+        popup.Controls.Add(layout);
+        var heading = new Label {Text = "LyricFrame", Font = new Font("Segoe UI", 17, FontStyle.Bold),
+            AutoSize = true, ForeColor = PopupText, Anchor = AnchorStyles.Left, Margin = Padding.Empty};
+        layout.Controls.Add(heading, 0, layout.RowCount++);
+        var close = new SettingsCloseButton {Anchor = AnchorStyles.Right};
+        var tooltip = new ToolTip {InitialDelay = 500};
+        tooltip.SetToolTip(close, "Close settings");
+        popup.Disposed += delegate { tooltip.Dispose(); };
+        close.Click += delegate { popup.Close(); };
+        layout.Controls.Add(close, 1, 0);
+        popup.CancelButton = close;
+        var appearanceCard = AddCard(layout, "Appearance");
+        Action<Appearance> save = value =>
+        {
+            try { File.WriteAllText(path, json.Serialize(value)); }
+            catch (Exception error) { MessageBox.Show(popup, error.Message, "LyricFrame"); }
+            frameKey = null;
+            Tick();
+        };
+
+        var fonts = PopupPicker();
+        fonts.Items.AddRange(FontFamily.Families.Select(family => family.Name).OrderBy(name => name).Cast<object>().ToArray());
+        fonts.SelectedItem = appearance.FontName;
+        fonts.SelectedIndexChanged += delegate
+        {
+            appearance.FontName = (string)fonts.SelectedItem;
+            save(appearance);
+        };
+        AddSetting(appearanceCard, "Font", fonts);
+
+        var color = PopupButton("Choose color");
+        var swatch = new Panel {Size = new Size(19, 19), Margin = new Padding(6, 9, 0, 0),
+            BackColor = Color.FromArgb(appearance.TextColor), BorderStyle = BorderStyle.FixedSingle, AccessibleName = "Current text color"};
+        var colorRow = new FlowLayoutPanel {AutoSize = true, WrapContents = false, Margin = Padding.Empty};
+        colorRow.Controls.Add(color);
+        colorRow.Controls.Add(swatch);
+        color.Click += delegate
+        {
+            using (var picker = new ColorDialog {Color = Color.FromArgb(appearance.TextColor), FullOpen = true})
+            {
+                if (picker.ShowDialog(popup) != DialogResult.OK) return;
+                appearance.TextColor = picker.Color.ToArgb();
+                swatch.BackColor = picker.Color;
+                save(appearance);
+            }
+        };
+        AddSetting(appearanceCard, "Text color", colorRow);
+        AddSizeSetting(appearanceCard, "Clock", appearance.ClockSize, value => { appearance.ClockSize = value; save(appearance); });
+        AddSizeSetting(appearanceCard, "Song title", appearance.TitleSize, value => { appearance.TitleSize = value; save(appearance); });
+        AddSizeSetting(appearanceCard, "Lyrics", appearance.LyricSize, value => { appearance.LyricSize = value; save(appearance); });
+
+        var desktopCard = AddCard(layout, "Desktop");
+        var backgroundButton = PopupButton("Choose image");
+        backgroundButton.Click += delegate { ChooseBackground(backgroundPath); };
+        AddSetting(desktopCard, "Background", backgroundButton);
+
+        var screens = Screen.AllScreens;
+        var display = PopupPicker();
+        foreach (var screen in screens)
+        {
+            var number = Regex.Match(screen.DeviceName, @"\d+$").Value;
+            display.Items.Add("Display " + number + " (" + screen.Bounds.Width + " × " + screen.Bounds.Height + ")" +
+                (screen.Primary ? " — primary" : ""));
+        }
+        display.SelectedIndex = Array.FindIndex(screens, screen => screen.DeviceName == TargetScreen().DeviceName);
+        display.SelectedIndexChanged += delegate
+        {
+            var device = screens[display.SelectedIndex].DeviceName;
+            try
+            {
+                File.WriteAllText(displayPath, device);
+                selectedDisplay = device;
+                surfaceAttempted = false;
+                frameKey = null;
+                Tick();
+                if (surface == null)
+                    tray.ShowBalloonTip(3500, "LyricFrame", "Could not attach to this display.", ToolTipIcon.Warning);
+            }
+            catch (Exception error) { MessageBox.Show(popup, error.Message, "LyricFrame"); }
+        };
+        AddSetting(desktopCard, "Display", display);
+
+        var startup = new CheckBox {Text = "Start with Windows", AutoSize = true, ForeColor = PopupText,
+            Margin = new Padding(3, 8, 3, 8), Checked = File.Exists(Startup)};
+        startup.Click += delegate
+        {
+            try { SetStartup(startup.Checked); }
+            catch (Exception error) { MessageBox.Show(popup, error.Message, "LyricFrame"); }
+            startup.Checked = File.Exists(Startup);
+        };
+        AddSetting(desktopCard, "Startup", startup);
+        var quit = PopupButton("Quit LyricFrame");
+        quit.ForeColor = Color.FromArgb(255, 180, 194);
+        quit.Margin = new Padding(3, 10, 3, 0);
+        quit.Anchor = AnchorStyles.Right;
+        quit.Click += delegate { ExitThread(); };
+        layout.Controls.Add(quit, 1, layout.RowCount++);
+
+        popup.HandleCreated += delegate
+        {
+            var margins = new FrameMargins {Bottom = 1};
+            DwmExtendFrameIntoClientArea(popup.Handle, ref margins);
+            int rounded = 2;
+            DwmSetWindowAttribute(popup.Handle, 33, ref rounded, sizeof(int));
+        };
+
+        var cursor = Cursor.Position;
+        var area = Screen.FromPoint(cursor).WorkingArea;
+        var size = popup.GetPreferredSize(Size.Empty);
+        popup.Location = new Point(Math.Max(area.Left, Math.Min(cursor.X - size.Width, area.Right - size.Width)),
+            Math.Max(area.Top, Math.Min(cursor.Y - size.Height, area.Bottom - size.Height)));
+        popup.Show();
+        popup.Activate();
+    }
+
+    static readonly Color PopupBackground = Color.FromArgb(18, 26, 36);
+    static readonly Color PopupCard = Color.FromArgb(24, 36, 49);
+    static readonly Color PopupControl = Color.FromArgb(33, 47, 63);
+    static readonly Color PopupText = Color.FromArgb(244, 249, 255);
+    static readonly Color PopupAccent = Color.FromArgb(145, 211, 249);
+    static readonly Color PopupHover = Color.FromArgb(44, 67, 88);
+
+    sealed class SettingsCloseButton : Button
+    {
+        bool hovered;
+
+        public SettingsCloseButton()
+        {
+            Size = new Size(34, 34);
+            Margin = Padding.Empty;
+            FlatStyle = FlatStyle.Flat;
+            AccessibleName = "Close settings";
+            Cursor = Cursors.Hand;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            hovered = true;
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            hovered = false;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(PopupBackground);
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            float centerX = ClientSize.Width / 2f;
+            float centerY = ClientSize.Height / 2f;
+            float scale = Math.Min(ClientSize.Width, ClientSize.Height) / 34f;
+            if (hovered || Focused && ShowFocusCues)
+            {
+                float radius = 13 * scale;
+                using (var brush = new SolidBrush(PopupHover))
+                    g.FillEllipse(brush, centerX - radius, centerY - radius, radius * 2, radius * 2);
+            }
+            using (var pen = new Pen(PopupText, 2 * scale))
+            {
+                pen.StartCap = pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                float arm = 5 * scale;
+                g.DrawLine(pen, centerX - arm, centerY - arm, centerX + arm, centerY + arm);
+                g.DrawLine(pen, centerX + arm, centerY - arm, centerX - arm, centerY + arm);
+            }
+        }
+    }
+
+    static Button PopupButton(string text)
+    {
+        var button = new Button {Text = text, AutoSize = true, MinimumSize = new Size(0, 30),
+            Padding = new Padding(9, 0, 9, 0), FlatStyle = FlatStyle.Flat, UseVisualStyleBackColor = false,
+            BackColor = PopupControl, ForeColor = PopupText};
+        button.FlatAppearance.BorderSize = 0;
+        button.FlatAppearance.MouseOverBackColor = PopupHover;
+        return button;
+    }
+
+    static ComboBox PopupPicker()
+    {
+        var picker = new ComboBox {DropDownStyle = ComboBoxStyle.DropDownList, Width = 208, DropDownWidth = 260,
+            DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 23, FlatStyle = FlatStyle.Flat,
+            BackColor = PopupControl, ForeColor = PopupText};
+        picker.DrawItem += delegate(object sender, DrawItemEventArgs e)
+        {
+            var selected = (e.State & DrawItemState.Selected) != 0;
+            using (var brush = new SolidBrush(selected ? PopupHover : PopupControl))
+                e.Graphics.FillRectangle(brush, e.Bounds);
+            if (e.Index >= 0)
+                TextRenderer.DrawText(e.Graphics, picker.GetItemText(picker.Items[e.Index]), e.Font, e.Bounds, PopupText,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            e.DrawFocusRectangle();
+        };
+        return picker;
+    }
+
+    static TableLayoutPanel AddCard(TableLayoutPanel layout, string text)
+    {
+        var card = new SettingsCard {AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 2, BackColor = PopupCard, Padding = new Padding(13, 10, 13, 11),
+            Margin = new Padding(0, 12, 0, 0), Anchor = AnchorStyles.Left | AnchorStyles.Right};
+        card.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
+        card.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        layout.Controls.Add(card, 0, layout.RowCount++);
+        layout.SetColumnSpan(card, 2);
+        var label = new Label {Text = text, AutoSize = true, ForeColor = PopupAccent,
+            Font = new Font("Segoe UI", 10, FontStyle.Bold), Margin = new Padding(3, 2, 3, 7)};
+        card.Controls.Add(label, 0, card.RowCount++);
+        card.SetColumnSpan(label, 2);
+        return card;
+    }
+
+    sealed class SettingsCard : TableLayoutPanel
+    {
+        public SettingsCard() { DoubleBuffered = true; ResizeRedraw = true; }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            int diameter = Math.Min((int)Math.Round(24 * e.Graphics.DpiX / 96), Math.Min(Width, Height));
+            e.Graphics.Clear(PopupBackground);
+            if (diameter < 2) return;
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var outline = new System.Drawing.Drawing2D.GraphicsPath())
+            using (var fill = new SolidBrush(BackColor))
+            {
+                outline.AddArc(0, 0, diameter, diameter, 180, 90);
+                outline.AddArc(Width - diameter, 0, diameter, diameter, 270, 90);
+                outline.AddArc(Width - diameter, Height - diameter, diameter, diameter, 0, 90);
+                outline.AddArc(0, Height - diameter, diameter, diameter, 90, 90);
+                outline.CloseFigure();
+                e.Graphics.FillPath(fill, outline);
+            }
+        }
+    }
+
+    static void AddSetting(TableLayoutPanel layout, string label, Control control)
+    {
+        int row = layout.RowCount++;
+        layout.Controls.Add(new Label {Text = label, ForeColor = PopupText, AutoSize = true,
+            Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 18, 7)}, 0, row);
+        control.Anchor = AnchorStyles.Left;
+        layout.Controls.Add(control, 1, row);
+    }
+
+    static void AddSizeSetting(TableLayoutPanel layout, string label, int size, Action<int> change)
+    {
+        var slider = new SizeSlider(label, size, change);
+        AddSetting(layout, label, slider);
+    }
+
+    sealed class SizeSlider : UserControl
+    {
+        public SizeSlider(string label, int size, Action<int> change)
+        {
+            Size = new Size(208, 29);
+            BackColor = PopupCard;
+            var slider = new TrackBar {Minimum = 50, Maximum = 150, SmallChange = 5, LargeChange = 10,
+                TickStyle = TickStyle.None, AutoSize = false, Size = new Size(158, 27),
+                Value = Math.Max(50, Math.Min(150, size)), AccessibleName = label + " size", BackColor = PopupCard};
+            var value = new Label {Size = new Size(48, 27), Location = new Point(160, 0),
+                TextAlign = ContentAlignment.MiddleRight, ForeColor = PopupAccent, Text = slider.Value + "%"};
+            slider.ValueChanged += delegate { value.Text = slider.Value + "%"; };
+            slider.MouseUp += delegate { change(slider.Value); };
+            slider.KeyUp += delegate { change(slider.Value); };
+            slider.MouseWheel += delegate { change(slider.Value); };
+            Controls.Add(slider);
+            Controls.Add(value);
+        }
     }
 
     static void SetStartup(bool enabled)
@@ -528,10 +826,10 @@ sealed class MusicDesktop : ApplicationContext
         return new SongLyrics {Status = failed ? "Lyrics sources unavailable · retrying" : "Lyrics not found for this song", Retry = failed};
     }
 
-    static void Draw(Graphics graphics, string text, float size, RectangleF bounds, bool right, bool bold)
+    void Draw(Graphics graphics, string text, float size, RectangleF bounds, bool right, bool bold)
     {
         if (text.Length == 0) return;
-        using (var font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Pixel))
+        using (var font = new Font(appearance.FontName, size, bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Pixel))
         {
             var rect = Rectangle.Round(bounds);
             var flags = TextFormatFlags.PreserveGraphicsClipping | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak |
@@ -539,7 +837,7 @@ sealed class MusicDesktop : ApplicationContext
             var shadow = rect;
             shadow.Offset(1, 2);
             TextRenderer.DrawText(graphics, text, font, shadow, Color.FromArgb(25, 30, 42), flags);
-            TextRenderer.DrawText(graphics, text, font, rect, Color.White, flags);
+            TextRenderer.DrawText(graphics, text, font, rect, Color.FromArgb(appearance.TextColor), flags);
         }
     }
 
@@ -634,8 +932,8 @@ sealed class MusicDesktop : ApplicationContext
         {
             var clipBounds = Rectangle.Intersect(Rectangle.Ceiling(graphics.ClipBounds), new Rectangle(Point.Empty, bounds.Size));
             graphics.DrawImage(scaledArt, clipBounds, clipBounds, GraphicsUnit.Pixel);
-            Draw(graphics, clock, h * .061f, new RectangleF(w * (.04f + insetX), h * (.045f + insetY), w * .32f, h * .11f), false, true);
-            Draw(graphics, title, h * .029f, new RectangleF(w * .52f, h * (.052f + insetY), w * (.44f - insetX), h * .08f), true, true);
+            Draw(graphics, clock, h * .061f * appearance.ClockSize / 100, new RectangleF(w * (.04f + insetX), h * (.045f + insetY), w * .40f, h * .15f), false, true);
+            Draw(graphics, title, h * .029f * appearance.TitleSize / 100, new RectangleF(w * .52f, h * (.052f + insetY), w * (.44f - insetX), h * .10f), true, true);
             var currentBounds = new RectangleF(w * .41f, h * (.828f - insetY), w * (.55f - insetX), h * .083f);
             var nextBounds = new RectangleF(w * .41f, h * (.910f - insetY), w * (.55f - insetX), h * .056f);
             if (progress < 1)
@@ -644,13 +942,13 @@ sealed class MusicDesktop : ApplicationContext
                 oldBounds.Offset(0, -h * .082f * (float)progress);
                 var clip = graphics.Save();
                 graphics.IntersectClip(RectangleF.FromLTRB(currentBounds.Left, currentBounds.Top, nextBounds.Right, nextBounds.Bottom));
-                Draw(graphics, outgoingLine, h * .033f, oldBounds, true, true);
+                Draw(graphics, outgoingLine, h * .033f * appearance.LyricSize / 100, oldBounds, true, true);
                 graphics.Restore(clip);
                 currentBounds.Offset(0, h * .082f * (float)(1 - progress));
                 nextBounds.Offset(0, h * .026f * (float)(1 - progress));
             }
-            Draw(graphics, line, h * .033f, currentBounds, true, true);
-            if (progress >= .65) Draw(graphics, nextLine, h * .023f, nextBounds, true, false);
+            Draw(graphics, line, h * .033f * appearance.LyricSize / 100, currentBounds, true, true);
+            if (progress >= .65) Draw(graphics, nextLine, h * .023f * appearance.LyricSize / 100, nextBounds, true, false);
         };
         if (surface != null)
         {
@@ -679,6 +977,7 @@ sealed class MusicDesktop : ApplicationContext
     protected override void ExitThreadCore()
     {
         closing = true;
+        if (settingsWindow != null) settingsWindow.Close();
         timer.Dispose();
         if (surface != null) surface.Dispose();
         if (scaledArt != null) scaledArt.Dispose();
@@ -686,7 +985,6 @@ sealed class MusicDesktop : ApplicationContext
         CancelLookup();
         if (image != null) image.Dispose();
         tray.Visible = false;
-        tray.ContextMenuStrip.Dispose();
         tray.Dispose();
         if (applied)
         {
@@ -698,6 +996,8 @@ sealed class MusicDesktop : ApplicationContext
         base.ExitThreadCore();
     }
 }
+
+
 
 
 

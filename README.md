@@ -8,7 +8,9 @@ A Windows tray app that puts the time, the current YouTube Music track, and lyri
 2. In Brave, Chrome, or Edge, open the Extensions page, enable **Developer mode**, choose **Load unpacked**, and select the extracted **extension** folder.
 3. Refresh YouTube Music and play a song. The extension badge shows **ON** when the app accepts track updates.
 
-Use the tray menu to change the background, select a display, or toggle **Start with Windows**. The app uses a blue gradient by default. Choose your own picture with **Change background**.
+Left-click the LyricFrame icon in the Windows notification area to open **Settings**. Choose an installed font, a text color, and separate sizes for the clock, song title, and lyrics. Changes apply immediately and are saved automatically.
+
+The same popup lets you choose a background image, select a display, toggle **Start with Windows**, and quit LyricFrame. Either mouse button opens it. The app uses a blue gradient by default.
 
 ## Build
 
