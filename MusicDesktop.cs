@@ -22,6 +22,10 @@ sealed class MusicDesktop : ApplicationContext
     static extern bool SystemParametersInfo(int action, int parameter, string value, int flags);
     [DllImport("user32.dll")]
     static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")]
+    static extern bool ReleaseCapture();
+    [DllImport("user32.dll")]
+    static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("dwmapi.dll")]
     static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
     [DllImport("dwmapi.dll")]
@@ -212,7 +216,17 @@ sealed class MusicDesktop : ApplicationContext
         };
         popup.Controls.Add(layout);
         var heading = new Label {Text = "LyricFrame", Font = new Font("Segoe UI", 17, FontStyle.Bold),
-            AutoSize = true, ForeColor = PopupText, Anchor = AnchorStyles.Left, Margin = Padding.Empty};
+            AutoSize = true, ForeColor = PopupText, Anchor = AnchorStyles.Left | AnchorStyles.Right,
+            Margin = Padding.Empty, Cursor = Cursors.SizeAll};
+        MouseEventHandler movePopup = delegate(object sender, MouseEventArgs args)
+        {
+            if (args.Button != MouseButtons.Left) return;
+            ReleaseCapture();
+            const uint systemCommand = 0x0112;
+            const int moveFromTitleBar = 0xF012;
+            SendMessage(popup.Handle, systemCommand, new IntPtr(moveFromTitleBar), IntPtr.Zero);
+        };
+        heading.MouseDown += movePopup;
         layout.Controls.Add(heading, 0, layout.RowCount++);
         var close = new SettingsCloseButton {Anchor = AnchorStyles.Right};
         var tooltip = new ToolTip {InitialDelay = 500};
@@ -222,6 +236,14 @@ sealed class MusicDesktop : ApplicationContext
         layout.Controls.Add(close, 1, 0);
         popup.CancelButton = close;
         var appearanceCard = AddCard(layout, "Appearance");
+        MouseEventHandler moveFromHeaderSpace = delegate(object sender, MouseEventArgs args)
+        {
+            var source = (Control)sender;
+            var point = layout.PointToClient(source.PointToScreen(args.Location));
+            if (point.Y < appearanceCard.Top) movePopup(sender, args);
+        };
+        layout.MouseDown += moveFromHeaderSpace;
+        popup.MouseDown += moveFromHeaderSpace;
         Action<Appearance> save = value =>
         {
             try { File.WriteAllText(path, json.Serialize(value)); }
