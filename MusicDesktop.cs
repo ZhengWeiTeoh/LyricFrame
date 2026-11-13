@@ -43,8 +43,7 @@ sealed class MusicDesktop : ApplicationContext
     Task<SongLyrics> lookup;
     CancellationTokenSource cancellation;
     SongLyrics lyrics;
-    DateTime retryAt, pageAt;
-    double plainTime;
+    DateTime retryAt;
     string lastError;
     string displayedLine = "", displayedNext = "", outgoingLine = "";
     long transitionAt;
@@ -321,7 +320,7 @@ sealed class MusicDesktop : ApplicationContext
         try
         {
             var track = Current();
-            var key = track == null ? "" : json.Serialize(new[] {track.title, track.artist, track.album, Math.Round(track.duration).ToString()});
+            var key = track == null ? "" : json.Serialize(new[] {track.title, track.artist, track.album});
             var now = DateTime.UtcNow;
             if (key != activeKey)
             {
@@ -329,8 +328,6 @@ sealed class MusicDesktop : ApplicationContext
                 activeKey = key;
                 cache.TryGetValue(key, out lyrics);
                 retryAt = DateTime.MinValue;
-                plainTime = 0;
-                pageAt = now;
             }
             if (lookup != null && lookup.IsCompleted)
             {
@@ -338,7 +335,6 @@ sealed class MusicDesktop : ApplicationContext
                 lookup = null;
                 cancellation.Dispose();
                 cancellation = null;
-                pageAt = now;
                 if (lyrics.Retry) retryAt = now.AddSeconds(65);
                 else if (lyrics.Timed.Count > 0 || lyrics.Plain.Length > 0)
                 {
@@ -355,24 +351,22 @@ sealed class MusicDesktop : ApplicationContext
             string line = "", nextLine = "";
             if (track != null && lyrics != null)
             {
-                if (track.duration > 0 && lyrics.Timed.Count > 0)
+                var position = Math.Max(0, track.position + Math.Min(2, Math.Max(0, (now - track.received).TotalSeconds)) * track.rate);
+                if (lyrics.Timed.Count > 0)
                 {
-                    double position = track.position + (track.playing ? Math.Min(2, (now - track.received).TotalSeconds) * track.rate : 0);
                     int index = lyrics.Timed.FindLastIndex(item => item.Key <= position);
                     if (index >= 0) line = lyrics.Timed[index].Value;
                     if (index + 1 < lyrics.Timed.Count) nextLine = lyrics.Timed[index + 1].Value;
                 }
                 else if (lyrics.Plain.Length > 0)
                 {
-                    if (track.playing) plainTime += Math.Min(1, (now - pageAt).TotalSeconds);
-                    int index = ((int)(plainTime / 6.5) % ((lyrics.Plain.Length + 1) / 2)) * 2;
+                    int index = PlainPage(position, track.duration, lyrics.Plain.Length) * 2;
                     line = lyrics.Plain[index];
                     if (index + 1 < lyrics.Plain.Length) nextLine = lyrics.Plain[index + 1];
                 }
                 else line = lyrics.Status;
             }
             else if (track != null) line = "Looking up lyrics…";
-            pageAt = now;
             Paint(track == null ? "" : track.title, line, nextLine);
             lastError = null;
         }
@@ -384,6 +378,13 @@ sealed class MusicDesktop : ApplicationContext
                 tray.ShowBalloonTip(3500, "Music Desktop", error.Message, ToolTipIcon.Warning);
             }
         }
+    }
+
+    static int PlainPage(double position, double duration, int lineCount)
+    {
+        int pages = (lineCount + 1) / 2;
+        double page = duration > 0 ? position / duration * pages : position / 6.5;
+        return (int)Math.Min(pages - 1, Math.Floor(Math.Max(0, page)));
     }
 
     void CancelLookup()
@@ -502,7 +503,7 @@ sealed class MusicDesktop : ApplicationContext
                         .OrderBy(record => Math.Abs(record.duration - track.duration)).FirstOrDefault();
                     var close = matching.Where(record => track.duration > 0 && Math.Abs(record.duration - track.duration) <= 2).ToArray();
                     var recordMatch = credited ?? (close.Select(record => Normalize(record.artistName)).Distinct().Count() == 1 ? close[0] : null);
-                    if (recordMatch != null) return Parse(recordMatch, name == track.title && track.duration > 0 && Math.Abs(recordMatch.duration - track.duration) <= 8);
+                if (recordMatch != null) return Parse(recordMatch, name == track.title && track.duration > 0 && Math.Abs(recordMatch.duration - track.duration) <= 2);
                     if (token.WaitHandle.WaitOne(400)) token.ThrowIfCancellationRequested();
                 }
             }
