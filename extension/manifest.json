@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Music Desktop for YouTube Music",
+  "version": "1.0.7",
+  "action": {
+    "default_title": "Music Desktop · Waiting for YouTube Music"
+  },
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "send.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://music.youtube.com/*"
+      ],
+      "js": [
+        "player.js"
+      ],
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://music.youtube.com/*"
+      ],
+      "js": [
+        "relay.js"
+      ]
+    }
+  ]
+}
