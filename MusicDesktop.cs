@@ -61,7 +61,6 @@ sealed class MusicDesktop : ApplicationContext
         public string title { get; set; }
         public string artist { get; set; }
         public string album { get; set; }
-        public string next { get; set; }
         public int tab { get; set; }
         public double position { get; set; }
         public double duration { get; set; }
@@ -282,7 +281,7 @@ sealed class MusicDesktop : ApplicationContext
                         if (bytes.Length < bodyAt + length) continue;
                         var track = new JavaScriptSerializer().Deserialize<Track>(Encoding.UTF8.GetString(raw, bodyAt, length));
                         if (track == null || track.title == null || (track.playing && string.IsNullOrWhiteSpace(track.title)) || track.title.Length > 500 ||
-                            new[] {track.artist, track.album, track.next}.Any(value => value == null || value.Length > 500) ||
+                            new[] {track.artist, track.album}.Any(value => value == null || value.Length > 500) ||
                             double.IsNaN(track.position) || double.IsInfinity(track.position) ||
                             double.IsNaN(track.duration) || double.IsInfinity(track.duration) ||
                             double.IsNaN(track.rate) || double.IsInfinity(track.rate) ||
@@ -374,7 +373,7 @@ sealed class MusicDesktop : ApplicationContext
             }
             else if (track != null) line = "Looking up lyrics…";
             pageAt = now;
-            Paint(track == null ? "" : track.title, track == null ? "" : track.next, line, nextLine);
+            Paint(track == null ? "" : track.title, line, nextLine);
             lastError = null;
         }
         catch (Exception error)
@@ -549,7 +548,7 @@ sealed class MusicDesktop : ApplicationContext
             Screen.AllScreens.FirstOrDefault(screen => !screen.Primary) ?? Screen.PrimaryScreen;
     }
 
-    void Paint(string title, string next, string line, string nextLine)
+    void Paint(string title, string line, string nextLine)
     {
         long now = System.Diagnostics.Stopwatch.GetTimestamp();
         if (line != displayedLine || nextLine != displayedNext)
@@ -592,7 +591,7 @@ sealed class MusicDesktop : ApplicationContext
         // Windows Fill center-crops the image on displays with a different aspect ratio.
         float insetX = surface != null ? 0 : Math.Max(0, (1 - aspects.Min() / aspect) / 2);
         float insetY = surface != null ? 0 : Math.Max(0, (1 - aspect / aspects.Max()) / 2);
-        var key = json.Serialize(new[] {background, bounds.Size.ToString(), insetX.ToString(), insetY.ToString(), clock, title, next, line, nextLine,
+        var key = json.Serialize(new[] {background, bounds.Size.ToString(), insetX.ToString(), insetY.ToString(), clock, title, line, nextLine,
             progress < 1 ? now.ToString() : ""});
         if (key == frameKey) return;
         if (background != loadedImage)
@@ -636,7 +635,6 @@ sealed class MusicDesktop : ApplicationContext
             graphics.DrawImage(scaledArt, clipBounds, clipBounds, GraphicsUnit.Pixel);
             Draw(graphics, clock, h * .061f, new RectangleF(w * (.04f + insetX), h * (.045f + insetY), w * .32f, h * .11f), false, true);
             Draw(graphics, title, h * .029f, new RectangleF(w * .52f, h * (.052f + insetY), w * (.44f - insetX), h * .08f), true, true);
-            Draw(graphics, next.Length == 0 ? "" : "Next: " + next, h * .020f, new RectangleF(w * .52f, h * (.127f + insetY), w * (.44f - insetX), h * .06f), true, false);
             var currentBounds = new RectangleF(w * .41f, h * (.828f - insetY), w * (.55f - insetX), h * .083f);
             var nextBounds = new RectangleF(w * .41f, h * (.910f - insetY), w * (.55f - insetX), h * .056f);
             if (progress < 1)
@@ -655,7 +653,7 @@ sealed class MusicDesktop : ApplicationContext
         };
         if (surface != null)
         {
-            var header = json.Serialize(new[] {artKey, clock, title, next});
+            var header = json.Serialize(new[] {artKey, clock, title});
             var dirty = header == chromeKey && frameKey != null
                 ? Rectangle.FromLTRB((int)(w * .40f), (int)(h * .82f), bounds.Width, bounds.Height)
                 : new Rectangle(Point.Empty, bounds.Size);
@@ -699,6 +697,7 @@ sealed class MusicDesktop : ApplicationContext
         base.ExitThreadCore();
     }
 }
+
 
 
 

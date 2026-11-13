@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Music Desktop for YouTube Music",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "action": {
     "default_title": "Music Desktop · Waiting for YouTube Music"
   },
@@ -31,3 +31,4 @@
     }
   ]
 }
+
