@@ -22,6 +22,9 @@ sealed class MusicDesktop : ApplicationContext
     static extern bool SystemParametersInfo(int action, int parameter, string value, int flags);
     [DllImport("user32.dll")]
     static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    static extern int LCMapStringEx(string locale, uint flags, string source, int sourceLength,
+        StringBuilder destination, int destinationLength, IntPtr version, IntPtr reserved, IntPtr sortHandle);
     [DllImport("user32.dll")]
     static extern bool ReleaseCapture();
     [DllImport("user32.dll")]
@@ -82,6 +85,7 @@ sealed class MusicDesktop : ApplicationContext
         public bool playing { get; set; }
         public DateTime received { get; set; }
         public bool? advancing { get; set; }
+        public string playerTitle { get; set; }
         public long ReceivedTimestamp { get; set; }
     }
 
@@ -98,6 +102,7 @@ sealed class MusicDesktop : ApplicationContext
 
     sealed class SongLyrics
     {
+        public string DisplayTitle;
         public readonly List<KeyValuePair<double, string>> Timed = new List<KeyValuePair<double, string>>();
         public string[] Plain = new string[0];
         public string Status = "";
@@ -607,6 +612,7 @@ sealed class MusicDesktop : ApplicationContext
                             double.IsNaN(track.duration) || double.IsInfinity(track.duration) ||
                             double.IsNaN(track.rate) || double.IsInfinity(track.rate) ||
                             track.position < 0 || track.duration < 0 || track.rate <= 0) return;
+                        if (track.playerTitle != null && track.playerTitle.Length > 500) return;
                         track.received = DateTime.UtcNow;
                         track.ReceivedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
                         lock (tracksLock)
@@ -643,7 +649,9 @@ sealed class MusicDesktop : ApplicationContext
         try
         {
             var track = Current();
-            var key = track == null ? "" : json.Serialize(new[] {track.title, track.artist, track.album});
+            var chineseTitle = track == null ? null : ChineseTitle(track.title, track.playerTitle);
+            var displayTitle = track == null ? "" : chineseTitle ?? track.title;
+            var key = track == null ? "" : json.Serialize(new[] {track.title, track.artist, track.album, displayTitle});
             var now = DateTime.UtcNow;
             if (key != activeKey)
             {
@@ -692,7 +700,7 @@ sealed class MusicDesktop : ApplicationContext
                 else line = lyrics.Status;
             }
             else if (track != null) line = "Looking up lyrics…";
-            Paint(track == null ? "" : track.title, line, nextLine);
+            Paint(track == null ? "" : chineseTitle ?? (lyrics == null ? null : lyrics.DisplayTitle) ?? displayTitle, line, nextLine);
             lastError = null;
         }
         catch (Exception error)
@@ -753,9 +761,8 @@ sealed class MusicDesktop : ApplicationContext
     static string[] TitleNames(string value)
     {
         var title = Normalize(value);
-        return new[] {title, Regex.Replace(title, @"\s*\([^()]+\)\s*$", "")}
-            .Concat(Regex.Matches(title, @"\(([^()]+)\)").Cast<Match>().Select(m => m.Groups[1].Value.Trim()))
-            .Where(name => name.Length > 0).ToArray();
+        return new[] {title}.Concat(TitleParts(title)).Select(MatchText)
+            .Where(name => name.Length > 0).Distinct().ToArray();
     }
 
     static SongLyrics Parse(Record record, bool synced)
@@ -794,18 +801,64 @@ sealed class MusicDesktop : ApplicationContext
         return result;
     }
 
+    static string ChineseTitle(params string[] titles)
+    {
+        foreach (var raw in titles)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) continue;
+            var title = raw.Normalize(NormalizationForm.FormKC).Trim();
+            if (Regex.IsMatch(title, @"[\u3040-\u30ff\uac00-\ud7af]")) continue;
+            var candidates = TitleParts(title);
+            var chinese = candidates.FirstOrDefault(part =>
+                Regex.IsMatch(part, @"[\u3400-\u9fff]") && !Regex.IsMatch(part, @"[a-zA-Z]") &&
+                !Regex.IsMatch(part, @"^(?:现场版|現場版|官方版|歌词|歌詞|完整版)$"));
+            if (chinese != null) return chinese.Trim();
+            if (Regex.IsMatch(title, @"[\u3400-\u9fff]")) return title;
+        }
+        return null;
+    }
+
+    static IEnumerable<string> TitleParts(string title)
+    {
+        return Regex.Split(title, @"[\(\)\[\]【】《》]|\s+[/|–—-]\s+")
+            .Select(part => part.Trim())
+            .Where(part => part.Length > 0 && !Regex.IsMatch(part, @"^(?:live|现场版|現場版|官方版|歌词|歌詞|完整版)$", RegexOptions.IgnoreCase));
+    }
+
+    static string MapChinese(string text, uint flags)
+    {
+        if (!Regex.IsMatch(text, @"[\u3400-\u9fff]")) return text;
+        var mapped = new StringBuilder(text.Length * 2 + 1);
+        int count = LCMapStringEx("zh-CN", flags, text, -1, mapped, mapped.Capacity,
+            IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        var result = count > 0 ? mapped.ToString() : text;
+        return flags == 0x02000000 ? result.Replace('後', '后') : result;
+    }
+
+    static string MatchText(string value)
+    {
+        return Regex.Replace(MapChinese(Normalize(value), 0x02000000), @"[\p{P}\s]+", "");
+    }
+
     static SongLyrics FindLyrics(Track track, CancellationToken token)
     {
         var artist = Regex.Replace(track.artist, @"\s+-\s+Topic$", "", RegexOptions.IgnoreCase);
         var baseTitle = Regex.Replace(track.title, @"\s*[\[(](?:live(?:\s+[^)\]]*)?|现场版|現場版)[)\]]\s*$", "", RegexOptions.IgnoreCase).Trim();
+        var chinese = ChineseTitle(track.title, track.playerTitle);
+        var directTitles = new[] {chinese, track.title, baseTitle}
+            .Where(value => !string.IsNullOrWhiteSpace(value)).Distinct().ToArray();
+        var searchTitles = directTitles.SelectMany(name => new[] {name, MapChinese(name, 0x02000000), MapChinese(name, 0x04000000)})
+            .Distinct().ToArray();
         bool failed = false, limited = false;
         SongLyrics plainMatch = null;
+        SongLyrics timedMatch = null;
         var encode = new Func<string,string>(Uri.EscapeDataString);
-        try
+        foreach (var name in directTitles)
         {
-            if (artist.Length > 0)
+            if (artist.Length == 0 || limited) break;
+            try
             {
-                string query = "track_name=" + encode(track.title) + "&artist_name=" + encode(artist);
+                string query = "track_name=" + encode(name) + "&artist_name=" + encode(artist);
                 if (track.album.Length > 0) query += "&album_name=" + encode(track.album);
                 if (track.duration >= 1 && track.duration <= 3600) query += "&duration=" + Math.Round(track.duration).ToString(System.Globalization.CultureInfo.InvariantCulture);
                 var record = Fetch<Record>("https://lrclib.net/api/get?" + query, token);
@@ -813,19 +866,25 @@ sealed class MusicDesktop : ApplicationContext
                 {
                     if (record.instrumental && CanSync(track, record)) return new SongLyrics();
                     var parsed = Parse(record, CanSync(track, record));
-                    if (parsed.Timed.Count > 0) return parsed;
-                    if (parsed.Plain.Length > 0) plainMatch = parsed;
+                    parsed.DisplayTitle = ChineseTitle(record.trackName);
+                    if (parsed.Timed.Count > 0)
+                    {
+                        if (chinese != null || parsed.DisplayTitle != null) return parsed;
+                        timedMatch = parsed;
+                        break;
+                    }
+                    if (plainMatch == null && parsed.Plain.Length > 0) plainMatch = parsed;
                 }
                 if (token.WaitHandle.WaitOne(400)) token.ThrowIfCancellationRequested();
             }
+            catch (WebException error)
+            {
+                failed = true;
+                using (var response = error.Response as HttpWebResponse)
+                    limited = response != null && (int)response.StatusCode == 429;
+            }
         }
-        catch (WebException error)
-        {
-            failed = true;
-            using (var response = error.Response as HttpWebResponse)
-                limited = response != null && (int)response.StatusCode == 429;
-        }
-        foreach (var name in new[] {track.title, baseTitle}.Where(value => value.Length > 0).Distinct())
+        foreach (var name in searchTitles)
         {
             token.ThrowIfCancellationRequested();
             try
@@ -835,14 +894,22 @@ sealed class MusicDesktop : ApplicationContext
                     var records = Fetch<Record[]>("https://lrclib.net/api/search?q=" + encode(name), token) ?? new Record[0];
                     var matching = records.Where(record => TitleNames(record.trackName).Intersect(TitleNames(name)).Any() &&
                         (!string.IsNullOrWhiteSpace(record.syncedLyrics) || !string.IsNullOrWhiteSpace(record.plainLyrics))).ToArray();
-                    var credited = matching.Where(record => artist.Length > 0 && Normalize(record.artistName) == Normalize(artist))
-                        .OrderByDescending(record => name == track.title && CanSync(track, record) && !string.IsNullOrWhiteSpace(record.syncedLyrics))
+                    var credited = matching.Where(record => ArtistMatches(record.artistName, artist))
+                        .OrderByDescending(record => CanSync(track, record) && !string.IsNullOrWhiteSpace(record.syncedLyrics))
+                        .ThenByDescending(record => ChineseTitle(record.trackName) != null)
                         .ThenBy(record => Math.Abs(record.duration - track.duration)).FirstOrDefault();
                     var close = matching.Where(record => track.duration > 0 && Math.Abs(record.duration - track.duration) <= 2).ToArray();
                     var recordMatch = credited ?? (close.Select(record => Normalize(record.artistName)).Distinct().Count() == 1 ? close[0] : null);
                     if (recordMatch != null)
                     {
-                        var parsed = Parse(recordMatch, name == track.title && CanSync(track, recordMatch));
+                        var parsed = Parse(recordMatch, CanSync(track, recordMatch));
+                        parsed.DisplayTitle = ChineseTitle(recordMatch.trackName);
+                        if (timedMatch != null)
+                        {
+                            if (CanSync(track, recordMatch) && ArtistMatches(recordMatch.artistName, artist))
+                                timedMatch.DisplayTitle = parsed.DisplayTitle;
+                            return timedMatch;
+                        }
                         if (parsed.Timed.Count > 0) return parsed;
                         if (plainMatch == null && parsed.Plain.Length > 0) plainMatch = parsed;
                     }
@@ -855,6 +922,7 @@ sealed class MusicDesktop : ApplicationContext
                 using (var response = error.Response as HttpWebResponse)
                     limited = response != null && (int)response.StatusCode == 429;
             }
+            if (timedMatch != null) return timedMatch;
             if (artist.Length == 0 || plainMatch != null) continue;
             try
             {
@@ -873,6 +941,25 @@ sealed class MusicDesktop : ApplicationContext
     static bool CanSync(Track track, Record record)
     {
         return track.duration > 0 && record.duration > 0 && Math.Abs(record.duration - track.duration) <= 2;
+    }
+
+    static IEnumerable<string> ArtistKeys(string artist)
+    {
+        var normalized = Regex.Replace(Normalize(artist), @"\s+-\s+topic$", "");
+        foreach (var part in Regex.Split(normalized, @"[()\[\]/、,&]"))
+        {
+            var words = Regex.Matches(part, @"[a-z]+").Cast<Match>().Select(word => word.Value).ToArray();
+            var han = string.Concat(Regex.Matches(part, @"[\u3400-\u9fff]+").Cast<Match>().Select(word => word.Value));
+            if (han.Length > 0) yield return MatchText(han);
+            if (words.Length > 0) yield return string.Concat(words.OrderBy(word => word, StringComparer.Ordinal));
+            var exact = MatchText(part);
+            if (exact.Length > 0) yield return exact;
+        }
+    }
+
+    static bool ArtistMatches(string left, string right)
+    {
+        return ArtistKeys(left).Intersect(ArtistKeys(right)).Any();
     }
 
     void Draw(Graphics graphics, string text, float size, RectangleF bounds, bool right, bool bold)
