@@ -15,11 +15,11 @@ function report() {
     title, artist: metadata?.artist || bar?.querySelector(".byline a")?.textContent.trim() || "",
     album: metadata?.album || "",
     duration: Number.isFinite(video.duration) ? video.duration : 0,
-    position: video.currentTime, playing: true,
+    position: video.currentTime, playing: true, advancing: !video.seeking && video.readyState >= 3,
     rate: video.playbackRate
   }}, location.origin);
 }
 setInterval(report, 1000);
-for (const event of ["playing", "pause", "ended", "emptied", "seeked", "ratechange"]) document.addEventListener(event, report, true);
+for (const event of ["playing", "pause", "ended", "emptied", "seeking", "seeked", "waiting", "ratechange"]) document.addEventListener(event, report, true);
 report();
 

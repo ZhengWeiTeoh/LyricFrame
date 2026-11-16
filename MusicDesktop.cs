@@ -81,6 +81,8 @@ sealed class MusicDesktop : ApplicationContext
         public double rate { get; set; }
         public bool playing { get; set; }
         public DateTime received { get; set; }
+        public bool? advancing { get; set; }
+        public long ReceivedTimestamp { get; set; }
     }
 
     sealed class Record
@@ -606,6 +608,7 @@ sealed class MusicDesktop : ApplicationContext
                             double.IsNaN(track.rate) || double.IsInfinity(track.rate) ||
                             track.position < 0 || track.duration < 0 || track.rate <= 0) return;
                         track.received = DateTime.UtcNow;
+                        track.ReceivedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
                         lock (tracksLock)
                         {
                             if (track.playing) tracks[track.tab] = track;
@@ -671,7 +674,9 @@ sealed class MusicDesktop : ApplicationContext
             string line = "", nextLine = "";
             if (track != null && lyrics != null)
             {
-                var position = Math.Max(0, track.position + Math.Min(2, Math.Max(0, (now - track.received).TotalSeconds)) * track.rate);
+                var elapsed = (System.Diagnostics.Stopwatch.GetTimestamp() - track.ReceivedTimestamp) /
+                    (double)System.Diagnostics.Stopwatch.Frequency;
+                var position = track.position + (track.advancing == false ? 0 : Math.Min(1.25, Math.Max(0, elapsed)) * track.rate);
                 if (lyrics.Timed.Count > 0)
                 {
                     int index = lyrics.Timed.FindLastIndex(item => item.Key <= position);
@@ -777,7 +782,12 @@ sealed class MusicDesktop : ApplicationContext
                 result.Timed.Add(new KeyValuePair<double,string>(minute * 60 + second + fraction - milliseconds / 1000, text));
             }
         }
-        result.Timed.Sort((left, right) => left.Key.CompareTo(right.Key));
+        var grouped = result.Timed.GroupBy(line => line.Key).OrderBy(group => group.Key)
+            .Select(group => new KeyValuePair<double, string>(group.Key,
+                string.Join(Environment.NewLine, group.Select(line => line.Value).Where(line => line.Length > 0).Distinct())))
+            .ToArray();
+        result.Timed.Clear();
+        result.Timed.AddRange(grouped);
         var plain = record.plainLyrics ?? record.lyrics;
         result.Plain = string.IsNullOrWhiteSpace(plain) ? words.ToArray() :
             plain.Split('\n').Select(line => line.Trim()).Where(line => line.Length > 0).ToArray();
@@ -789,6 +799,7 @@ sealed class MusicDesktop : ApplicationContext
         var artist = Regex.Replace(track.artist, @"\s+-\s+Topic$", "", RegexOptions.IgnoreCase);
         var baseTitle = Regex.Replace(track.title, @"\s*[\[(](?:live(?:\s+[^)\]]*)?|现场版|現場版)[)\]]\s*$", "", RegexOptions.IgnoreCase).Trim();
         bool failed = false, limited = false;
+        SongLyrics plainMatch = null;
         var encode = new Func<string,string>(Uri.EscapeDataString);
         try
         {
@@ -798,8 +809,13 @@ sealed class MusicDesktop : ApplicationContext
                 if (track.album.Length > 0) query += "&album_name=" + encode(track.album);
                 if (track.duration >= 1 && track.duration <= 3600) query += "&duration=" + Math.Round(track.duration).ToString(System.Globalization.CultureInfo.InvariantCulture);
                 var record = Fetch<Record>("https://lrclib.net/api/get?" + query, token);
-                if (record != null && (record.instrumental || record.syncedLyrics != null || record.plainLyrics != null))
-                    return record.instrumental ? new SongLyrics() : Parse(record, true);
+                if (record != null)
+                {
+                    if (record.instrumental && CanSync(track, record)) return new SongLyrics();
+                    var parsed = Parse(record, CanSync(track, record));
+                    if (parsed.Timed.Count > 0) return parsed;
+                    if (parsed.Plain.Length > 0) plainMatch = parsed;
+                }
                 if (token.WaitHandle.WaitOne(400)) token.ThrowIfCancellationRequested();
             }
         }
@@ -818,12 +834,18 @@ sealed class MusicDesktop : ApplicationContext
                 {
                     var records = Fetch<Record[]>("https://lrclib.net/api/search?q=" + encode(name), token) ?? new Record[0];
                     var matching = records.Where(record => TitleNames(record.trackName).Intersect(TitleNames(name)).Any() &&
-                        (record.syncedLyrics != null || record.plainLyrics != null)).ToArray();
+                        (!string.IsNullOrWhiteSpace(record.syncedLyrics) || !string.IsNullOrWhiteSpace(record.plainLyrics))).ToArray();
                     var credited = matching.Where(record => artist.Length > 0 && Normalize(record.artistName) == Normalize(artist))
-                        .OrderBy(record => Math.Abs(record.duration - track.duration)).FirstOrDefault();
+                        .OrderByDescending(record => name == track.title && CanSync(track, record) && !string.IsNullOrWhiteSpace(record.syncedLyrics))
+                        .ThenBy(record => Math.Abs(record.duration - track.duration)).FirstOrDefault();
                     var close = matching.Where(record => track.duration > 0 && Math.Abs(record.duration - track.duration) <= 2).ToArray();
                     var recordMatch = credited ?? (close.Select(record => Normalize(record.artistName)).Distinct().Count() == 1 ? close[0] : null);
-                if (recordMatch != null) return Parse(recordMatch, name == track.title && track.duration > 0 && Math.Abs(recordMatch.duration - track.duration) <= 2);
+                    if (recordMatch != null)
+                    {
+                        var parsed = Parse(recordMatch, name == track.title && CanSync(track, recordMatch));
+                        if (parsed.Timed.Count > 0) return parsed;
+                        if (plainMatch == null && parsed.Plain.Length > 0) plainMatch = parsed;
+                    }
                     if (token.WaitHandle.WaitOne(400)) token.ThrowIfCancellationRequested();
                 }
             }
@@ -833,11 +855,11 @@ sealed class MusicDesktop : ApplicationContext
                 using (var response = error.Response as HttpWebResponse)
                     limited = response != null && (int)response.StatusCode == 429;
             }
-            if (artist.Length == 0) continue;
+            if (artist.Length == 0 || plainMatch != null) continue;
             try
             {
                 var fallback = Fetch<Record>("https://api.lyrics.ovh/v1/" + encode(artist) + "/" + encode(name), token);
-                if (fallback != null && !string.IsNullOrWhiteSpace(fallback.lyrics)) return Parse(fallback, false);
+                if (fallback != null && !string.IsNullOrWhiteSpace(fallback.lyrics)) plainMatch = Parse(fallback, false);
             }
             catch (WebException error)
             {
@@ -845,7 +867,12 @@ sealed class MusicDesktop : ApplicationContext
                 if (error.Response != null) error.Response.Close();
             }
         }
-        return new SongLyrics {Status = failed ? "Lyrics sources unavailable · retrying" : "Lyrics not found for this song", Retry = failed};
+        return plainMatch ?? new SongLyrics {Status = failed ? "Lyrics sources unavailable · retrying" : "Lyrics not found for this song", Retry = failed};
+    }
+
+    static bool CanSync(Track track, Record record)
+    {
+        return track.duration > 0 && record.duration > 0 && Math.Abs(record.duration - track.duration) <= 2;
     }
 
     void Draw(Graphics graphics, string text, float size, RectangleF bounds, bool right, bool bold)
@@ -901,7 +928,7 @@ sealed class MusicDesktop : ApplicationContext
             surface = null;
             frameKey = null;
         }
-        var interval = surface != null && progress < 1 ? 16 : 500;
+        var interval = surface != null && progress < 1 ? 16 : title.Length > 0 ? 100 : 500;
         if (timer.Interval != interval) timer.Interval = interval;
         if (surface == null) progress = 1;
         var clock = DateTime.Now.ToString("HH:mm");
