@@ -61,6 +61,8 @@ sealed class MusicDesktop : ApplicationContext
     Task<SongLyrics> lookup;
     CancellationTokenSource cancellation;
     SongLyrics lyrics;
+    SongLyrics titleLyrics;
+    string titleTrackKey, formattedTitle;
     DateTime retryAt;
     string lastError;
     string displayedLine = "", displayedNext = "", outgoingLine = "";
@@ -102,7 +104,8 @@ sealed class MusicDesktop : ApplicationContext
 
     sealed class SongLyrics
     {
-        public string DisplayTitle;
+        public string ProviderTitle;
+        public string Language;
         public readonly List<KeyValuePair<double, string>> Timed = new List<KeyValuePair<double, string>>();
         public string[] Plain = new string[0];
         public string Status = "";
@@ -649,9 +652,7 @@ sealed class MusicDesktop : ApplicationContext
         try
         {
             var track = Current();
-            var chineseTitle = track == null ? null : ChineseTitle(track.title, track.playerTitle);
-            var displayTitle = track == null ? "" : chineseTitle ?? track.title;
-            var key = track == null ? "" : json.Serialize(new[] {track.title, track.artist, track.album, displayTitle});
+            var key = track == null ? "" : json.Serialize(new[] {track.title, track.artist, track.album, track.playerTitle});
             var now = DateTime.UtcNow;
             if (key != activeKey)
             {
@@ -700,7 +701,13 @@ sealed class MusicDesktop : ApplicationContext
                 else line = lyrics.Status;
             }
             else if (track != null) line = "Looking up lyrics…";
-            Paint(track == null ? "" : chineseTitle ?? (lyrics == null ? null : lyrics.DisplayTitle) ?? displayTitle, line, nextLine);
+            if (key != titleTrackKey || lyrics != titleLyrics)
+            {
+                titleTrackKey = key;
+                titleLyrics = lyrics;
+                formattedTitle = track == null ? "" : FormatTrackTitle(track, lyrics);
+            }
+            Paint(formattedTitle ?? "", line, nextLine);
             lastError = null;
         }
         catch (Exception error)
@@ -798,7 +805,45 @@ sealed class MusicDesktop : ApplicationContext
         var plain = record.plainLyrics ?? record.lyrics;
         result.Plain = string.IsNullOrWhiteSpace(plain) ? words.ToArray() :
             plain.Split('\n').Select(line => line.Trim()).Where(line => line.Length > 0).ToArray();
+        result.ProviderTitle = record.trackName;
+        var textSample = string.Join(" ", result.Plain.Take(20));
+        int han = Regex.Matches(textSample, @"[\u3400-\u9fff]").Count;
+        int latin = Regex.Matches(textSample, @"[a-zA-Z]").Count;
+        if (HasKana(textSample)) result.Language = "ja";
+        else if (han > 0 && han >= latin / 2) result.Language = "zh";
+        else if (latin > 0 && han == 0) result.Language = "en";
         return result;
+    }
+
+    static bool HasKana(string text)
+    {
+        return Regex.IsMatch(text ?? "", @"[\u3041-\u3096\u30a1-\u30fa\uff66-\uff9d]");
+    }
+
+    static string FormatTrackTitle(Track track, SongLyrics lyrics)
+    {
+        var titles = new[] {track.title, track.playerTitle, lyrics == null ? null : lyrics.ProviderTitle};
+        var parts = titles.Where(title => !string.IsNullOrWhiteSpace(title))
+            .SelectMany(TitleParts).ToArray();
+        var language = lyrics == null ? null : lyrics.Language;
+        if (language == "ja" || parts.Any(HasKana))
+        {
+            var kanji = parts.Where(part => Regex.IsMatch(part, @"[\u3400-\u9fff]")).ToArray();
+            var japanese = kanji.FirstOrDefault(HasKana) ?? kanji.FirstOrDefault() ??
+                parts.FirstOrDefault(HasKana) ?? track.title;
+            var english = parts.FirstOrDefault(part => !HasKana(part) &&
+                !Regex.IsMatch(part, @"[\u3400-\u9fff]") && Regex.IsMatch(part, @"[a-zA-Z]"));
+            var aliases = kanji.Where(part => !HasKana(part)).Concat(new[] {english})
+                .Where(part => !string.IsNullOrWhiteSpace(part) && MatchText(part) != MatchText(japanese))
+                .GroupBy(MatchText).Select(group => group.First()).ToArray();
+            return aliases.Length == 0 ? japanese : japanese + "\n" + string.Join(" / ", aliases);
+        }
+        if (language == "en")
+            return parts.FirstOrDefault(part => Regex.IsMatch(part, @"[a-zA-Z]") &&
+                !Regex.IsMatch(part, @"[\u3400-\u9fff]")) ?? track.title;
+        if (language == "zh") return ChineseTitle(titles) ?? track.title;
+        var primary = TitleParts(track.title).FirstOrDefault();
+        return primary != null && Regex.IsMatch(primary, @"[\u3400-\u9fff]") ? primary : track.title;
     }
 
     static string ChineseTitle(params string[] titles)
@@ -844,8 +889,10 @@ sealed class MusicDesktop : ApplicationContext
     {
         var artist = Regex.Replace(track.artist, @"\s+-\s+Topic$", "", RegexOptions.IgnoreCase);
         var baseTitle = Regex.Replace(track.title, @"\s*[\[(](?:live(?:\s+[^)\]]*)?|现场版|現場版)[)\]]\s*$", "", RegexOptions.IgnoreCase).Trim();
-        var chinese = ChineseTitle(track.title, track.playerTitle);
-        var directTitles = new[] {chinese, track.title, baseTitle}
+        var chinese = HasKana(track.title) || HasKana(track.playerTitle) ? null : ChineseTitle(track.title, track.playerTitle);
+        var firstPart = TitleParts(track.title).FirstOrDefault();
+        bool chineseFirst = chinese != null && firstPart != null && Regex.IsMatch(firstPart, @"[\u3400-\u9fff]");
+        var directTitles = (chineseFirst ? new[] {chinese, track.title, baseTitle} : new[] {track.title, chinese, baseTitle})
             .Where(value => !string.IsNullOrWhiteSpace(value)).Distinct().ToArray();
         var searchTitles = directTitles.SelectMany(name => new[] {name, MapChinese(name, 0x02000000), MapChinese(name, 0x04000000)})
             .Distinct().ToArray();
@@ -866,10 +913,10 @@ sealed class MusicDesktop : ApplicationContext
                 {
                     if (record.instrumental && CanSync(track, record)) return new SongLyrics();
                     var parsed = Parse(record, CanSync(track, record));
-                    parsed.DisplayTitle = ChineseTitle(record.trackName);
                     if (parsed.Timed.Count > 0)
                     {
-                        if (chinese != null || parsed.DisplayTitle != null) return parsed;
+                        if (parsed.Language == "en" || parsed.Language != "ja" &&
+                            (ChineseTitle(record.trackName) != null || chinese != null)) return parsed;
                         timedMatch = parsed;
                         break;
                     }
@@ -896,18 +943,17 @@ sealed class MusicDesktop : ApplicationContext
                         (!string.IsNullOrWhiteSpace(record.syncedLyrics) || !string.IsNullOrWhiteSpace(record.plainLyrics))).ToArray();
                     var credited = matching.Where(record => ArtistMatches(record.artistName, artist))
                         .OrderByDescending(record => CanSync(track, record) && !string.IsNullOrWhiteSpace(record.syncedLyrics))
-                        .ThenByDescending(record => ChineseTitle(record.trackName) != null)
+                        .ThenByDescending(record => TitleParts(record.trackName).Any(part => ChineseTitle(part) != null))
                         .ThenBy(record => Math.Abs(record.duration - track.duration)).FirstOrDefault();
                     var close = matching.Where(record => track.duration > 0 && Math.Abs(record.duration - track.duration) <= 2).ToArray();
                     var recordMatch = credited ?? (close.Select(record => Normalize(record.artistName)).Distinct().Count() == 1 ? close[0] : null);
                     if (recordMatch != null)
                     {
                         var parsed = Parse(recordMatch, CanSync(track, recordMatch));
-                        parsed.DisplayTitle = ChineseTitle(recordMatch.trackName);
                         if (timedMatch != null)
                         {
                             if (CanSync(track, recordMatch) && ArtistMatches(recordMatch.artistName, artist))
-                                timedMatch.DisplayTitle = parsed.DisplayTitle;
+                                timedMatch.ProviderTitle = parsed.ProviderTitle;
                             return timedMatch;
                         }
                         if (parsed.Timed.Count > 0) return parsed;
@@ -1069,7 +1115,14 @@ sealed class MusicDesktop : ApplicationContext
             var clipBounds = Rectangle.Intersect(Rectangle.Ceiling(graphics.ClipBounds), new Rectangle(Point.Empty, bounds.Size));
             graphics.DrawImage(scaledArt, clipBounds, clipBounds, GraphicsUnit.Pixel);
             Draw(graphics, clock, h * .061f * appearance.ClockSize / 100, new RectangleF(w * (.04f + insetX), h * (.045f + insetY), w * .40f, h * .15f), false, true);
-            Draw(graphics, title, h * .029f * appearance.TitleSize / 100, new RectangleF(w * .52f, h * (.052f + insetY), w * (.44f - insetX), h * .10f), true, true);
+            var titleParts = title.Split(new[] {'\n'}, 2);
+            var titleScale = appearance.TitleSize / 100f;
+            var titleBounds = new RectangleF(w * .52f, h * (.052f + insetY), w * (.44f - insetX),
+                h * (titleParts.Length > 1 ? .045f * titleScale : .10f));
+            Draw(graphics, titleParts[0], h * .029f * titleScale, titleBounds, true, true);
+            if (titleParts.Length > 1)
+                Draw(graphics, titleParts[1], h * .020f * titleScale,
+                    new RectangleF(titleBounds.Left, titleBounds.Bottom, titleBounds.Width, h * .065f), true, false);
             var currentBounds = new RectangleF(w * .41f, h * (.828f - insetY), w * (.55f - insetX), h * .083f);
             var nextBounds = new RectangleF(w * .41f, h * (.910f - insetY), w * (.55f - insetX), h * .056f);
             if (progress < 1)
