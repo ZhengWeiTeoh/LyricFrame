@@ -71,7 +71,7 @@ sealed class MusicDesktop : ApplicationContext
     DesktopSurface surface;
     Bitmap scaledArt;
     string scaledKey, chromeKey;
-    bool surfaceAttempted;
+    DateTime nextAttachAttempt;
     string selectedDisplay;
     string attachedDisplay;
 
@@ -314,7 +314,7 @@ sealed class MusicDesktop : ApplicationContext
             {
                 File.WriteAllText(displayPath, device);
                 selectedDisplay = device;
-                surfaceAttempted = false;
+                nextAttachAttempt = DateTime.MinValue;
                 frameKey = null;
                 Tick();
                 if (surface == null)
@@ -325,12 +325,12 @@ sealed class MusicDesktop : ApplicationContext
         AddSetting(desktopCard, "Display", display);
 
         var startup = new CheckBox {Text = "Start with Windows", AutoSize = true, ForeColor = PopupText,
-            Margin = new Padding(3, 8, 3, 8), Checked = File.Exists(Startup)};
+            Margin = new Padding(3, 8, 3, 8), Checked = StartupEnabled()};
         startup.Click += delegate
         {
             try { SetStartup(startup.Checked); }
             catch (Exception error) { MessageBox.Show(popup, error.Message, "LyricFrame"); }
-            startup.Checked = File.Exists(Startup);
+            startup.Checked = StartupEnabled();
         };
         AddSetting(desktopCard, "Startup", startup);
         var quit = PopupButton("Quit LyricFrame");
@@ -518,24 +518,68 @@ sealed class MusicDesktop : ApplicationContext
         }
     }
 
-    static void SetStartup(bool enabled)
+    static string StartupTaskName(string userSid)
     {
-        if (!enabled) { File.Delete(Startup); return; }
-        var shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
-        object link = null;
+        return "LyricFrame-" + userSid;
+    }
+
+    static bool StartupEnabled()
+    {
+        if (File.Exists(Startup)) return true;
         try
         {
-            link = shell.GetType().InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] {Startup});
-            var type = link.GetType();
-            type.InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, link, new object[] {Application.ExecutablePath});
-            type.InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, link, new object[] {AppDomain.CurrentDomain.BaseDirectory});
-            type.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, link, null);
+            return ConfigureStartupTask(null);
         }
-                finally
+        catch (COMException) { return false; }
+    }
+
+    static void SetStartup(bool enabled)
+    {
+        ConfigureStartupTask(enabled);
+        File.Delete(Startup);
+    }
+
+    static bool ConfigureStartupTask(bool? enabled)
+    {
+        using (var identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+        {
+            var sid = identity.User.Value;
+            var taskName = StartupTaskName(sid);
+            dynamic scheduler = Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service"));
+            scheduler.Connect();
+            dynamic root = scheduler.GetFolder(@"\");
+            if (enabled != true)
+            {
+                try
                 {
-                    if (link != null) Marshal.FinalReleaseComObject(link);
-                    Marshal.FinalReleaseComObject(shell);
+                    if (enabled == false) root.DeleteTask(taskName, 0);
+                    else return (bool)root.GetTask(taskName).Enabled;
                 }
+                catch (COMException error)
+                {
+                    if (error.ErrorCode != unchecked((int)0x80070002)) throw;
+                }
+                return false;
+            }
+
+            const int logonTrigger = 9;
+            const int execAction = 0;
+            const int createOrUpdate = 6;
+            const int interactiveToken = 3;
+            dynamic task = scheduler.NewTask(0);
+            task.RegistrationInfo.Description = "Starts LyricFrame when you sign in to Windows.";
+            task.Principal.UserId = sid;
+            task.Principal.LogonType = interactiveToken;
+            task.Settings.DisallowStartIfOnBatteries = false;
+            task.Settings.StopIfGoingOnBatteries = false;
+            task.Settings.ExecutionTimeLimit = "PT0S";
+            task.Triggers.Create(logonTrigger).UserId = sid;
+            dynamic action = task.Actions.Create(execAction);
+            action.Path = Application.ExecutablePath;
+            action.WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            root.RegisterTaskDefinition(taskName, task, createOrUpdate, sid, null, interactiveToken, null);
+            return true;
+        }
     }
 
     void ChooseBackground(string preference)
@@ -1046,13 +1090,13 @@ sealed class MusicDesktop : ApplicationContext
         {
             if (surface != null) surface.Dispose();
             surface = null;
-            surfaceAttempted = false;
+            nextAttachAttempt = DateTime.MinValue;
             attachedDisplay = target.DeviceName;
             frameKey = null;
         }
-        if (!surfaceAttempted)
+        if (surface == null && DateTime.UtcNow >= nextAttachAttempt)
         {
-            surfaceAttempted = true;
+            nextAttachAttempt = DateTime.UtcNow.AddSeconds(2);
             surface = DesktopSurface.Attach(target.Bounds);
         }
         if (surface != null && !surface.Attached)
@@ -1185,6 +1229,7 @@ sealed class MusicDesktop : ApplicationContext
         base.ExitThreadCore();
     }
 }
+
 
 
 
